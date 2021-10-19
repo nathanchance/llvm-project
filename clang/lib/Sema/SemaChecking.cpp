@@ -13494,11 +13494,11 @@ static void AnalyzeImplicitConversions(
         BO->getRHS()->isKnownToHaveBooleanValue() &&
         BO->getLHS()->HasSideEffects(S.Context) &&
         BO->getRHS()->HasSideEffects(S.Context)) {
+      std::string LogicalOpStr = BO->getOpcode() == BO_And ? "&&" : "||";
       S.Diag(BO->getBeginLoc(), diag::warn_bitwise_instead_of_logical)
-          << (BO->getOpcode() == BO_And ? "&" : "|") << OrigE->getSourceRange()
-          << FixItHint::CreateReplacement(
-                 BO->getOperatorLoc(),
-                 (BO->getOpcode() == BO_And ? "&&" : "||"));
+          << (BO->getOpcode() == BO_And ? "&" : "|") << LogicalOpStr
+          << OrigE->getSourceRange()
+          << FixItHint::CreateReplacement(BO->getOperatorLoc(), LogicalOpStr);
       S.Diag(BO->getBeginLoc(), diag::note_cast_operand_to_int);
     }
 

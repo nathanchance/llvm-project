@@ -7459,7 +7459,7 @@ def note_member_declared_here : Note<
 def note_member_first_declared_here : Note<
   "member %0 first declared here">;
 def warn_bitwise_instead_of_logical : Warning<
-  "use of bitwise '%0' with boolean operands">,
+  "use of bitwise '%0' with boolean operands; did you mean logical '%1'?">,
   InGroup<BitwiseInsteadOfLogical>, DefaultIgnore;
 def warn_bitwise_negation_bool : Warning<
   "bitwise negation of a boolean expression%select{;| always evaluates to 'true';}0 "
