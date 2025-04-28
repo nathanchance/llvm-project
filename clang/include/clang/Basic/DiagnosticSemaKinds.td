@@ -8206,7 +8206,7 @@ def warn_default_init_const : Warning<
 def warn_default_init_const_unsafe : Warning<
   "default initialization of an object of type %0%select{| with const member}1 "
   "leaves the object uninitialized and is incompatible with C++">,
-  InGroup<DefaultConstInitUnsafe>;
+  InGroup<DefaultConstInitUnsafe>, DefaultIgnore;
 def err_default_init_const : Error<
   "default initialization of an object of const type %0"
   "%select{| without a user-provided default constructor}1">;
