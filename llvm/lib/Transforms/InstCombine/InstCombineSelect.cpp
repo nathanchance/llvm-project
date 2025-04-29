@@ -49,6 +49,8 @@
 using namespace llvm;
 using namespace PatternMatch;
 
+static cl::opt<bool> Undo_b326cb6792b3("undo-b326cb6792b3", cl::Hidden,
+                                       cl::desc("Undo b326cb6792b3"));
 
 /// Replace a select operand based on an equality comparison with the identity
 /// constant of a binop.
@@ -108,6 +110,131 @@ static Instruction *foldSelectBinOpIdentity(SelectInst &Sel,
   // =>
   // S = { select (cmp eq X, C),  Y, ? } or { select (cmp ne X, C), ?,  Y }
   return IC.replaceOperand(Sel, IsEq ? 1 : 2, Y);
+}
+
+static Value *foldSelectICmpAndOld(SelectInst &Sel, ICmpInst *Cmp,
+                                   InstCombiner::BuilderTy &Builder,
+                                   const SimplifyQuery &SQ) {
+  const APInt *SelTC, *SelFC;
+  if (!match(Sel.getTrueValue(), m_APInt(SelTC)) ||
+      !match(Sel.getFalseValue(), m_APInt(SelFC)))
+    return nullptr;
+
+  // If this is a vector select, we need a vector compare.
+  Type *SelType = Sel.getType();
+  if (SelType->isVectorTy() != Cmp->getType()->isVectorTy())
+    return nullptr;
+
+  Value *V;
+  APInt AndMask;
+  bool CreateAnd = false;
+  ICmpInst::Predicate Pred = Cmp->getPredicate();
+  if (ICmpInst::isEquality(Pred)) {
+    if (!match(Cmp->getOperand(1), m_Zero()))
+      return nullptr;
+
+    V = Cmp->getOperand(0);
+    const APInt *AndRHS;
+    if (!match(V, m_And(m_Value(), m_Power2(AndRHS))))
+      return nullptr;
+
+    AndMask = *AndRHS;
+  } else if (auto Res = decomposeBitTestICmp(Cmp->getOperand(0),
+                                             Cmp->getOperand(1), Pred)) {
+    assert(ICmpInst::isEquality(Res->Pred) && "Not equality test?");
+    AndMask = Res->Mask;
+    V = Res->X;
+    KnownBits Known =
+        computeKnownBits(V, /*Depth=*/0, SQ.getWithInstruction(&Sel));
+    AndMask &= Known.getMaxValue();
+    if (!AndMask.isPowerOf2())
+      return nullptr;
+
+    Pred = Res->Pred;
+    CreateAnd = true;
+  } else {
+    return nullptr;
+  }
+  if (Pred == ICmpInst::ICMP_NE)
+    std::swap(SelTC, SelFC);
+
+  // In general, when both constants are non-zero, we would need an offset to
+  // replace the select. This would require more instructions than we started
+  // with. But there's one special-case that we handle here because it can
+  // simplify/reduce the instructions.
+  const APInt &TC = *SelTC;
+  const APInt &FC = *SelFC;
+  if (!TC.isZero() && !FC.isZero()) {
+    if (TC.getBitWidth() != AndMask.getBitWidth())
+      return nullptr;
+    // If we have to create an 'and', then we must kill the cmp to not
+    // increase the instruction count.
+    if (CreateAnd && !Cmp->hasOneUse())
+      return nullptr;
+
+    // (V & AndMaskC) == 0 ? TC : FC --> TC | (V & AndMaskC)
+    // (V & AndMaskC) == 0 ? TC : FC --> TC ^ (V & AndMaskC)
+    // (V & AndMaskC) == 0 ? TC : FC --> TC + (V & AndMaskC)
+    // (V & AndMaskC) == 0 ? TC : FC --> TC - (V & AndMaskC)
+    Constant *TCC = ConstantInt::get(SelType, TC);
+    Constant *FCC = ConstantInt::get(SelType, FC);
+    Constant *MaskC = ConstantInt::get(SelType, AndMask);
+    for (auto Opc : {Instruction::Or, Instruction::Xor, Instruction::Add,
+                     Instruction::Sub}) {
+      if (ConstantFoldBinaryOpOperands(Opc, TCC, MaskC, Sel.getDataLayout()) ==
+          FCC) {
+        if (CreateAnd)
+          V = Builder.CreateAnd(V, MaskC);
+        return Builder.CreateBinOp(Opc, TCC, V);
+      }
+    }
+
+    return nullptr;
+  }
+
+  // Make sure one of the select arms is a power-of-2.
+  if (!TC.isPowerOf2() && !FC.isPowerOf2())
+    return nullptr;
+
+  // Determine which shift is needed to transform result of the 'and' into the
+  // desired result.
+  const APInt &ValC = !TC.isZero() ? TC : FC;
+  unsigned ValZeros = ValC.logBase2();
+  unsigned AndZeros = AndMask.logBase2();
+  bool ShouldNotVal = !TC.isZero();
+  bool NeedShift = ValZeros != AndZeros;
+  bool NeedZExtTrunc =
+      SelType->getScalarSizeInBits() != V->getType()->getScalarSizeInBits();
+
+  // If we would need to create an 'and' + 'shift' + 'xor' + cast to replace
+  // a 'select' + 'icmp', then this transformation would result in more
+  // instructions and potentially interfere with other folding.
+  if (CreateAnd + ShouldNotVal + NeedShift + NeedZExtTrunc >
+      1 + Cmp->hasOneUse())
+    return nullptr;
+
+  // Insert the 'and' instruction on the input to the truncate.
+  if (CreateAnd)
+    V = Builder.CreateAnd(V, ConstantInt::get(V->getType(), AndMask));
+
+  // If types don't match, we can still convert the select by introducing a zext
+  // or a trunc of the 'and'.
+  if (ValZeros > AndZeros) {
+    V = Builder.CreateZExtOrTrunc(V, SelType);
+    V = Builder.CreateShl(V, ValZeros - AndZeros);
+  } else if (ValZeros < AndZeros) {
+    V = Builder.CreateLShr(V, AndZeros - ValZeros);
+    V = Builder.CreateZExtOrTrunc(V, SelType);
+  } else {
+    V = Builder.CreateZExtOrTrunc(V, SelType);
+  }
+
+  // Okay, now we know that everything is set up, we just don't know whether we
+  // have a icmp_ne or icmp_eq and whether the true or false val is the zero.
+  if (ShouldNotVal)
+    V = Builder.CreateXor(V, ValC);
+
+  return V;
 }
 
 /// This folds:
@@ -1971,6 +2098,10 @@ Instruction *InstCombinerImpl::foldSelectInstWithICmp(SelectInst &SI,
   if (Instruction *NewSel =
           tryToReuseConstantFromSelectInComparison(SI, *ICI, *this))
     return NewSel;
+
+  if (Undo_b326cb6792b3)
+    if (Value *V = foldSelectICmpAndOld(SI, ICI, Builder, SQ))
+      return replaceInstUsesWith(SI, V);
 
   // NOTE: if we wanted to, this is where to detect integer MIN/MAX
   bool Changed = false;
@@ -3969,8 +4100,9 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {
     if (Instruction *Result = foldSelectInstWithICmp(SI, ICI))
       return Result;
 
-  if (Value *V = foldSelectICmpAnd(SI, CondVal, Builder, SQ))
-    return replaceInstUsesWith(SI, V);
+  if (!Undo_b326cb6792b3)
+    if (Value *V = foldSelectICmpAnd(SI, CondVal, Builder, SQ))
+      return replaceInstUsesWith(SI, V);
 
   if (Value *V = foldSelectICmpAndBinOp(CondVal, TrueVal, FalseVal, Builder))
     return replaceInstUsesWith(SI, V);
